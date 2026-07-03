@@ -324,11 +324,15 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> dict
             fp += int((pred & ~truth).sum().item())
             tn += int((~pred & ~truth).sum().item())
             fn += int((~pred & truth).sum().item())
+    precision = tp / max(1, tp + fp)
+    recall = tp / max(1, tp + fn)
+    f1 = 2.0 * precision * recall / max(1e-12, precision + recall)
     return {
         "loss": total_loss / max(1, total),
         "accuracy": correct / max(1, total),
-        "precision": tp / max(1, tp + fp),
-        "recall": tp / max(1, tp + fn),
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
         "tp": tp,
         "fp": fp,
         "tn": tn,
@@ -384,6 +388,10 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
     loss_fn = nn.BCEWithLogitsLoss()
     history = []
+    best_epoch = 0
+    best_val_f1 = -1.0
+    best_val_loss = float("inf")
+    best_state_dict = None
 
     print(f"device={device}")
     if torch.cuda.is_available():
@@ -414,22 +422,38 @@ def main() -> None:
             "val": val_metrics,
         }
         history.append(row)
+        is_better = (
+            val_metrics["f1"] > best_val_f1
+            or (val_metrics["f1"] == best_val_f1 and val_metrics["loss"] < best_val_loss)
+        )
+        if is_better:
+            best_epoch = epoch
+            best_val_f1 = float(val_metrics["f1"])
+            best_val_loss = float(val_metrics["loss"])
+            best_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         print(
             f"epoch {epoch:03d}: "
             f"train_loss={train_metrics['loss']:.4f} train_acc={train_metrics['accuracy']:.3f} "
             f"val_loss={val_metrics['loss']:.4f} val_acc={val_metrics['accuracy']:.3f} "
-            f"val_precision={val_metrics['precision']:.3f} val_recall={val_metrics['recall']:.3f}",
+            f"val_precision={val_metrics['precision']:.3f} val_recall={val_metrics['recall']:.3f} "
+            f"val_f1={val_metrics['f1']:.3f}",
             flush=True,
         )
+
+    if best_state_dict is None:
+        best_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
     args.out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": best_state_dict,
             "patch_radius_zyx": radius_zyx,
             "patch_shape_zyx": patch_shape,
             "model": "TinyPatchScorer",
             "training_mode": "classical_proposal_rescorer",
+            "best_epoch": best_epoch,
+            "best_val_f1": best_val_f1,
+            "best_val_loss": best_val_loss,
         },
         args.out_path,
     )
@@ -452,12 +476,15 @@ def main() -> None:
         "val_patches": int(len(val_ds)),
         "device": str(device),
         "cuda_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "best_epoch": best_epoch,
+        "best_val_f1": best_val_f1,
+        "best_val_loss": best_val_loss,
         "history": history,
         "out_path": str(args.out_path),
     }
     args.metrics_path.parent.mkdir(parents=True, exist_ok=True)
     args.metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    print(f"wrote weights: {args.out_path}")
+    print(f"wrote best epoch {best_epoch} weights: {args.out_path}")
     print(f"wrote metrics: {args.metrics_path}")
 
 
