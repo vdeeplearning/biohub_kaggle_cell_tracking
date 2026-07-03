@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import random
 import subprocess
@@ -56,6 +57,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--install-missing-zarr", action="store_true")
+    parser.add_argument(
+        "--manual-labels",
+        type=Path,
+        default=Path("manual_labels/manual_centroids.csv"),
+        help=(
+            "Optional CSV of manual point labels with columns dataset,t,z,y,x,label,source. "
+            "Positive and negative rows are cropped directly as extra training examples."
+        ),
+    )
+    parser.add_argument(
+        "--manual-repeat",
+        type=int,
+        default=1,
+        help="Duplicate manual positive/negative patches this many times to upweight them.",
+    )
     return parser.parse_args()
 
 
@@ -90,6 +106,37 @@ def load_geff_nodes(zarr_module, geff_path: Path) -> np.ndarray:
     y = np.asarray(root["nodes/props/y/values"]).astype(np.int64)
     x = np.asarray(root["nodes/props/x/values"]).astype(np.int64)
     return np.stack([node_ids, t, z, y, x], axis=1)
+
+
+def load_manual_labels(path: Path) -> dict[str, list[tuple[int, np.ndarray, int]]]:
+    labels_by_sample: dict[str, list[tuple[int, np.ndarray, int]]] = {}
+    if not path.exists():
+        return labels_by_sample
+
+    with path.open(newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            label_text = row.get("label", "").strip().lower()
+            if label_text == "positive":
+                label = 1
+            elif label_text == "negative":
+                label = 0
+            else:
+                continue
+
+            sample_name = row.get("dataset", "").strip()
+            if not sample_name:
+                continue
+            t = int(round(float(row["t"])))
+            zyx = np.asarray(
+                [
+                    float(row["z"]),
+                    float(row["y"]),
+                    float(row["x"]),
+                ],
+                dtype=np.float32,
+            )
+            labels_by_sample.setdefault(sample_name, []).append((t, zyx, label))
+    return labels_by_sample
 
 
 def crop_patch(volume: np.ndarray, center_zyx: np.ndarray, radius_zyx: tuple[int, int, int]) -> np.ndarray | None:
@@ -156,6 +203,9 @@ class ProposalPatchSet:
     positive_candidates: int
     negative_candidates: int
     ignored_candidates: int
+    manual_positive_patches: int
+    manual_negative_patches: int
+    manual_skipped_labels: int
 
 
 def build_patch_set(
@@ -171,6 +221,8 @@ def build_patch_set(
     negative_score_quantile: float,
     max_positive_proposals_per_sample: int,
     max_negative_proposals_per_sample: int,
+    manual_labels_by_sample: dict[str, list[tuple[int, np.ndarray, int]]],
+    manual_repeat: int,
     seed: int,
 ) -> ProposalPatchSet:
     rng = np.random.default_rng(seed)
@@ -180,6 +232,9 @@ def build_patch_set(
     total_positive_candidates = 0
     total_negative_candidates = 0
     total_ignored_candidates = 0
+    total_manual_positive = 0
+    total_manual_negative = 0
+    total_manual_skipped = 0
 
     for sample_index, (sample_name, zarr_path, geff_path) in enumerate(pairs, start=1):
         image = zarr_module.open(zarr_path / "0", mode="r")
@@ -234,15 +289,46 @@ def build_patch_set(
                 else:
                     added_neg += 1
 
+        manual_added_pos = 0
+        manual_added_neg = 0
+        sample_manual_labels = manual_labels_by_sample.get(sample_name, [])
+        for t, zyx, label in sample_manual_labels:
+            if t < 0 or t >= image.shape[0]:
+                total_manual_skipped += 1
+                continue
+            if t not in frame_cache:
+                frame_cache[t] = np.asarray(image[t, :, :, :])
+            patch = crop_patch(frame_cache[t], zyx, radius_zyx)
+            if patch is None:
+                total_manual_skipped += 1
+                continue
+            normalized = normalize_patch(patch)
+            for _ in range(max(1, manual_repeat)):
+                patches.append(normalized)
+                labels.append(label)
+                sample_names.append(sample_name)
+            if label == 1:
+                manual_added_pos += max(1, manual_repeat)
+            else:
+                manual_added_neg += max(1, manual_repeat)
+
         total_positive_candidates += len(pos_pool)
         total_negative_candidates += len(neg_pool)
         total_ignored_candidates += ignored
+        total_manual_positive += manual_added_pos
+        total_manual_negative += manual_added_neg
         print(
             f"[{sample_index}/{len(pairs)}] {sample_name}: "
             f"pos_candidates={len(pos_pool)}, neg_candidates={len(neg_pool)}, ignored={ignored}, "
-            f"added_pos={added_pos}, added_neg={added_neg}",
+            f"added_pos={added_pos}, added_neg={added_neg}, "
+            f"manual_pos={manual_added_pos}, manual_neg={manual_added_neg}",
             flush=True,
         )
+
+    selected_names = {name for name, _, _ in pairs}
+    total_manual_skipped += sum(
+        len(rows) for name, rows in manual_labels_by_sample.items() if name not in selected_names
+    )
 
     return ProposalPatchSet(
         patches=patches,
@@ -251,6 +337,9 @@ def build_patch_set(
         positive_candidates=total_positive_candidates,
         negative_candidates=total_negative_candidates,
         ignored_candidates=total_ignored_candidates,
+        manual_positive_patches=total_manual_positive,
+        manual_negative_patches=total_manual_negative,
+        manual_skipped_labels=total_manual_skipped,
     )
 
 
@@ -359,6 +448,12 @@ def main() -> None:
 
     print(f"using {len(pairs)} samples from {args.train_dir}")
     print(f"patch shape zyx={patch_shape}")
+    manual_labels_by_sample = load_manual_labels(args.manual_labels)
+    manual_label_count = sum(len(rows) for rows in manual_labels_by_sample.values())
+    if manual_label_count:
+        print(f"using {manual_label_count} manual labels from {args.manual_labels}")
+    else:
+        print(f"no manual positive/negative labels found at {args.manual_labels}")
     patch_set = build_patch_set(
         zarr_module,
         pairs,
@@ -372,6 +467,8 @@ def main() -> None:
         negative_score_quantile=args.negative_score_quantile,
         max_positive_proposals_per_sample=args.max_positive_proposals_per_sample,
         max_negative_proposals_per_sample=args.max_negative_proposals_per_sample,
+        manual_labels_by_sample=manual_labels_by_sample,
+        manual_repeat=args.manual_repeat,
         seed=args.seed,
     )
     if not patch_set.patches:
@@ -472,6 +569,12 @@ def main() -> None:
         "positive_candidates_before_cap": patch_set.positive_candidates,
         "negative_candidates_before_cap": patch_set.negative_candidates,
         "ignored_candidates": patch_set.ignored_candidates,
+        "manual_labels_path": str(args.manual_labels),
+        "manual_label_rows_loaded": manual_label_count,
+        "manual_positive_patches": patch_set.manual_positive_patches,
+        "manual_negative_patches": patch_set.manual_negative_patches,
+        "manual_skipped_labels": patch_set.manual_skipped_labels,
+        "manual_repeat": args.manual_repeat,
         "train_patches": int(len(train_ds)),
         "val_patches": int(len(val_ds)),
         "device": str(device),
