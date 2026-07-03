@@ -1,0 +1,17 @@
+.venv/
+.venv_viewer/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+data/
+outputs/
+
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.npy
+*.npz
+
+submission.csv

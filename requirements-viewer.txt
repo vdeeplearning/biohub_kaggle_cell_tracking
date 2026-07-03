@@ -1,0 +1,6 @@
+napari[all]>=0.5
+zarr>=3
+dask[array]>=2024.0
+numpy>=1.26
+scipy>=1.11
+scikit-image>=0.22
