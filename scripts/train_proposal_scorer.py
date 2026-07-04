@@ -4,8 +4,6 @@ import argparse
 import csv
 import json
 import random
-import subprocess
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +14,8 @@ from scipy.ndimage import gaussian_filter
 from skimage.feature import peak_local_max
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+
+from simple_zarr import open_array, open_group
 
 
 SCALE_ZYX = np.asarray([1.625, 0.40625, 0.40625], dtype=np.float32)
@@ -56,7 +56,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=123)
-    parser.add_argument("--install-missing-zarr", action="store_true")
+    parser.add_argument(
+        "--install-missing-zarr",
+        action="store_true",
+        help="Deprecated compatibility flag; this script now uses the local simple_zarr reader.",
+    )
     parser.add_argument(
         "--manual-labels",
         type=Path,
@@ -75,31 +79,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def import_zarr(install_missing: bool):
-    try:
-        import zarr  # type: ignore
-
-        return zarr
-    except ModuleNotFoundError:
-        if not install_missing:
-            raise ModuleNotFoundError(
-                "zarr is not installed. In Kaggle, rerun with --install-missing-zarr "
-                "or run `!pip install -q zarr` first."
-            )
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "zarr"], check=True)
-        import zarr  # type: ignore
-
-        return zarr
-
-
 def find_pairs(train_dir: Path) -> list[tuple[str, Path, Path]]:
     zarrs = {p.name.removesuffix(".zarr"): p for p in train_dir.glob("*.zarr") if p.is_dir()}
     geffs = {p.name.removesuffix(".geff"): p for p in train_dir.glob("*.geff") if p.is_dir()}
     return [(name, zarrs[name], geffs[name]) for name in sorted(set(zarrs) & set(geffs))]
 
 
-def load_geff_nodes(zarr_module, geff_path: Path) -> np.ndarray:
-    root = zarr_module.open_group(geff_path, mode="r")
+def load_geff_nodes(geff_path: Path) -> np.ndarray:
+    root = open_group(geff_path, mode="r")
     node_ids = np.asarray(root["nodes/ids"]).astype(np.int64)
     t = np.asarray(root["nodes/props/t/values"]).astype(np.int64)
     z = np.asarray(root["nodes/props/z/values"]).astype(np.int64)
@@ -209,7 +196,6 @@ class ProposalPatchSet:
 
 
 def build_patch_set(
-    zarr_module,
     pairs: list[tuple[str, Path, Path]],
     radius_zyx: tuple[int, int, int],
     sigma_zyx: tuple[float, float, float],
@@ -237,8 +223,8 @@ def build_patch_set(
     total_manual_skipped = 0
 
     for sample_index, (sample_name, zarr_path, geff_path) in enumerate(pairs, start=1):
-        image = zarr_module.open(zarr_path / "0", mode="r")
-        geff_nodes = load_geff_nodes(zarr_module, geff_path)
+        image = open_array(zarr_path / "0", mode="r")
+        geff_nodes = load_geff_nodes(geff_path)
         labels_by_t = {int(t): geff_nodes[geff_nodes[:, 1] == t, 2:5] for t in np.unique(geff_nodes[:, 1])}
 
         pos_pool: list[tuple[np.ndarray, int]] = []
@@ -437,7 +423,6 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    zarr_module = import_zarr(args.install_missing_zarr)
     pairs = find_pairs(args.train_dir)
     if not pairs:
         raise SystemExit(f"No .zarr/.geff pairs found in {args.train_dir}")
@@ -455,7 +440,6 @@ def main() -> None:
     else:
         print(f"no manual positive/negative labels found at {args.manual_labels}")
     patch_set = build_patch_set(
-        zarr_module,
         pairs,
         radius_zyx=radius_zyx,
         sigma_zyx=sigma_zyx,

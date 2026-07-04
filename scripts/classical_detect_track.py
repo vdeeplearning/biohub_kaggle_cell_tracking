@@ -9,10 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import zarr
 from scipy.ndimage import gaussian_filter, label as connected_components
 from scipy.optimize import linear_sum_assignment
 from skimage.feature import peak_local_max
+
+from simple_zarr import open_array, open_group
 
 
 SCALE_ZYX = np.asarray([1.625, 0.40625, 0.40625], dtype=np.float32)
@@ -136,7 +137,7 @@ def parse_int_triplet(text: str, option_name: str) -> tuple[int, int, int]:
 
 
 def load_geff(geff_path: Path) -> tuple[np.ndarray, np.ndarray]:
-    root = zarr.open_group(geff_path, mode="r")
+    root = open_group(geff_path, mode="r")
     node_ids = np.asarray(root["nodes/ids"]).astype(np.int64)
     t = np.asarray(root["nodes/props/t/values"]).astype(np.int64)
     z = np.asarray(root["nodes/props/z/values"]).astype(np.int64)
@@ -150,7 +151,7 @@ def load_geff(geff_path: Path) -> tuple[np.ndarray, np.ndarray]:
 
 
 def load_estimated_number_of_nodes(geff_path: Path) -> int | None:
-    root = zarr.open_group(geff_path, mode="r")
+    root = open_group(geff_path, mode="r")
     geff_attrs = root.attrs.get("geff", {})
     extra = geff_attrs.get("extra", {})
     estimated = extra.get("estimated_number_of_nodes")
@@ -1066,7 +1067,7 @@ def main() -> None:
     total_start = time.perf_counter()
 
     stage_start = time.perf_counter()
-    image = zarr.open(args.zarr_path / args.array_path, mode="r")
+    image = open_array(args.zarr_path / args.array_path, mode="r")
     profile["open_seconds"] = time.perf_counter() - stage_start
     sample_name = args.zarr_path.stem
     print(f"sample={sample_name}, shape={image.shape}, dtype={image.dtype}")
