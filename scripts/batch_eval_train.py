@@ -68,6 +68,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--centroid-alpha", type=float, default=0.25)
     parser.add_argument("--centroid-background-percentile", type=float, default=20.0)
     parser.add_argument("--centroid-crop-radius-zyx", default="5,10,10")
+    parser.add_argument("--proposal-scorer-path", type=Path, default=None)
+    parser.add_argument("--proposal-scorer-threshold", type=float, default=0.5)
+    parser.add_argument("--proposal-scorer-oversample-factor", type=float, default=3.0)
+    parser.add_argument("--proposal-scorer-batch-size", type=int, default=512)
+    parser.add_argument("--proposal-scorer-device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--proposal-scorer-min-keep-fraction", type=float, default=0.5)
     parser.add_argument("--sample", action="append", default=None, help="Sample stem to include. Repeatable.")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--skip-existing", action="store_true")
@@ -204,6 +210,23 @@ def main() -> None:
                         str(args.centroid_background_percentile),
                         "--centroid-crop-radius-zyx",
                         args.centroid_crop_radius_zyx,
+                    ]
+                )
+            if args.proposal_scorer_path is not None:
+                cmd.extend(
+                    [
+                        "--proposal-scorer-path",
+                        str(args.proposal_scorer_path),
+                        "--proposal-scorer-threshold",
+                        str(args.proposal_scorer_threshold),
+                        "--proposal-scorer-oversample-factor",
+                        str(args.proposal_scorer_oversample_factor),
+                        "--proposal-scorer-batch-size",
+                        str(args.proposal_scorer_batch_size),
+                        "--proposal-scorer-device",
+                        args.proposal_scorer_device,
+                        "--proposal-scorer-min-keep-fraction",
+                        str(args.proposal_scorer_min_keep_fraction),
                     ]
                 )
             subprocess.run(cmd, check=True)

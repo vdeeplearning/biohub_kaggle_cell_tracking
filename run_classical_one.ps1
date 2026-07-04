@@ -18,6 +18,12 @@ param(
     [double]$BlobAlpha = 0.35,
     [double]$BlobBackgroundPercentile = 20.0,
     [string]$BlobCropRadiusZyx = "4,8,8",
+    [string]$ProposalScorerPath = "",
+    [double]$ProposalScorerThreshold = 0.5,
+    [double]$ProposalScorerOversampleFactor = 3.0,
+    [int]$ProposalScorerBatchSize = 256,
+    [string]$ProposalScorerDevice = "auto",
+    [double]$ProposalScorerMinKeepFraction = 0.5,
     [double]$LinkMaxDistanceUm = 7.0,
     [switch]$EnableGlobalFlow,
     [double]$FlowConfidentDistanceUm = 4.0,
@@ -88,6 +94,23 @@ if ($EnableGlobalFlow) {
         "--enable-global-flow",
         "--flow-confident-distance-um",
         "$FlowConfidentDistanceUm"
+    )
+}
+
+if ($ProposalScorerPath -ne "") {
+    $ArgsList += @(
+        "--proposal-scorer-path",
+        "$ProposalScorerPath",
+        "--proposal-scorer-threshold",
+        "$ProposalScorerThreshold",
+        "--proposal-scorer-oversample-factor",
+        "$ProposalScorerOversampleFactor",
+        "--proposal-scorer-batch-size",
+        "$ProposalScorerBatchSize",
+        "--proposal-scorer-device",
+        "$ProposalScorerDevice",
+        "--proposal-scorer-min-keep-fraction",
+        "$ProposalScorerMinKeepFraction"
     )
 }
 

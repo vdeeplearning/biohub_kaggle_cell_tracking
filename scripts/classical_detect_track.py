@@ -5,6 +5,7 @@ import csv
 import json
 import time
 from collections import defaultdict, deque
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -74,6 +75,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--centroid-alpha", type=float, default=0.25)
     parser.add_argument("--centroid-background-percentile", type=float, default=20.0)
     parser.add_argument("--centroid-crop-radius-zyx", default="5,10,10")
+    parser.add_argument(
+        "--proposal-scorer-path",
+        type=Path,
+        default=None,
+        help="Optional TinyPatchScorer .pt checkpoint used to rescore/rank peak proposals.",
+    )
+    parser.add_argument("--proposal-scorer-threshold", type=float, default=0.5)
+    parser.add_argument("--proposal-scorer-oversample-factor", type=float, default=3.0)
+    parser.add_argument("--proposal-scorer-batch-size", type=int, default=256)
+    parser.add_argument("--proposal-scorer-device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument(
+        "--proposal-scorer-min-keep-fraction",
+        type=float,
+        default=0.5,
+        help=(
+            "If thresholding is too strict, still keep at least this fraction of max_peaks "
+            "from the top CNN-ranked candidates."
+        ),
+    )
     parser.add_argument("--link-max-distance-um", type=float, default=7.0)
     parser.add_argument(
         "--enable-global-flow",
@@ -135,6 +155,129 @@ def load_estimated_number_of_nodes(geff_path: Path) -> int | None:
     extra = geff_attrs.get("extra", {})
     estimated = extra.get("estimated_number_of_nodes")
     return int(estimated) if estimated is not None else None
+
+
+def normalize_patch(patch: np.ndarray) -> np.ndarray:
+    patch = patch.astype(np.float32, copy=False)
+    low = float(np.percentile(patch, 10))
+    high = float(np.percentile(patch, 99))
+    scale = max(high - low, 1.0)
+    return np.clip((patch - low) / scale, 0.0, 1.0).astype(np.float32)
+
+
+def crop_patch(volume: np.ndarray, center_zyx: np.ndarray, radius_zyx: tuple[int, int, int]) -> np.ndarray | None:
+    center = np.asarray(np.rint(center_zyx), dtype=np.int64)
+    radius = np.asarray(radius_zyx, dtype=np.int64)
+    lo = center - radius
+    hi = center + radius + 1
+    shape = np.asarray(volume.shape, dtype=np.int64)
+    if np.any(lo < 0) or np.any(hi > shape):
+        return None
+    return volume[lo[0] : hi[0], lo[1] : hi[1], lo[2] : hi[2]]
+
+
+@dataclass
+class ProposalScorer:
+    torch: object
+    model: object
+    device: object
+    patch_radius_zyx: tuple[int, int, int]
+
+
+def load_proposal_scorer(checkpoint_path: Path, device_name: str) -> ProposalScorer:
+    try:
+        import torch
+        from torch import nn
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "PyTorch is required for --proposal-scorer-path. "
+            "Install torch or run without the proposal scorer."
+        ) from exc
+
+    class TinyPatchScorer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Conv3d(1, 8, kernel_size=3, padding=1),
+                nn.BatchNorm3d(8),
+                nn.ReLU(inplace=True),
+                nn.MaxPool3d((1, 2, 2)),
+                nn.Conv3d(8, 16, kernel_size=3, padding=1),
+                nn.BatchNorm3d(16),
+                nn.ReLU(inplace=True),
+                nn.MaxPool3d((2, 2, 2)),
+                nn.Conv3d(16, 32, kernel_size=3, padding=1),
+                nn.BatchNorm3d(32),
+                nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool3d(1),
+            )
+            self.head = nn.Sequential(nn.Flatten(), nn.Linear(32, 1))
+
+        def forward(self, x):
+            return self.head(self.net(x)).squeeze(1)
+
+    if device_name == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device_name)
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model = TinyPatchScorer().to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    patch_radius_zyx = tuple(int(v) for v in checkpoint.get("patch_radius_zyx", (5, 10, 10)))
+    print(
+        f"loaded proposal scorer {checkpoint_path} on {device}; "
+        f"patch_radius_zyx={patch_radius_zyx}, best_epoch={checkpoint.get('best_epoch')}"
+    )
+    return ProposalScorer(torch=torch, model=model, device=device, patch_radius_zyx=patch_radius_zyx)
+
+
+def rescore_proposals_with_cnn(
+    volume: np.ndarray,
+    peaks: np.ndarray,
+    intensities: np.ndarray,
+    scorer: ProposalScorer,
+    max_peaks: int,
+    threshold: float,
+    batch_size: int,
+    min_keep_fraction: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    if len(peaks) == 0:
+        return peaks, intensities.astype(np.float32)
+
+    valid_indices: list[int] = []
+    patches: list[np.ndarray] = []
+    for idx, peak in enumerate(peaks):
+        patch = crop_patch(volume, peak, scorer.patch_radius_zyx)
+        if patch is None:
+            continue
+        valid_indices.append(idx)
+        patches.append(normalize_patch(patch))
+
+    if not patches:
+        return np.zeros((0, 3), dtype=np.float32), np.zeros((0,), dtype=np.float32)
+
+    torch = scorer.torch
+    scores: list[np.ndarray] = []
+    with torch.no_grad():
+        for start in range(0, len(patches), batch_size):
+            batch = np.stack(patches[start : start + batch_size], axis=0)
+            x = torch.from_numpy(batch[:, None, :, :, :]).to(scorer.device)
+            logits = scorer.model(x)
+            probs = torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32)
+            scores.append(probs)
+
+    cnn_scores = np.concatenate(scores)
+    valid_peaks = peaks[np.asarray(valid_indices, dtype=np.int64)].astype(np.float32)
+    valid_intensities = intensities[np.asarray(valid_indices, dtype=np.int64)].astype(np.float32)
+    order = np.lexsort((-valid_intensities, -cnn_scores))
+
+    keep_mask = cnn_scores[order] >= threshold
+    min_keep = int(round(max_peaks * max(0.0, min(min_keep_fraction, 1.0))))
+    keep_count = min(max_peaks, max(int(np.count_nonzero(keep_mask)), min_keep))
+    selected = order[:keep_count]
+    return valid_peaks[selected], cnn_scores[selected].astype(np.float32)
 
 
 def local_blob_voxel_count(
@@ -347,6 +490,11 @@ def detect_frame(
     centroid_alpha: float = 0.25,
     centroid_background_percentile: float = 20.0,
     centroid_crop_radius_zyx: tuple[int, int, int] = (5, 10, 10),
+    proposal_scorer: ProposalScorer | None = None,
+    proposal_scorer_threshold: float = 0.5,
+    proposal_scorer_oversample_factor: float = 3.0,
+    proposal_scorer_batch_size: int = 256,
+    proposal_scorer_min_keep_fraction: float = 0.5,
 ) -> np.ndarray:
     smoothed = preprocess_for_detection(
         volume,
@@ -360,16 +508,18 @@ def detect_frame(
         return np.zeros((0, 4), dtype=np.float32)
 
     threshold = float(np.percentile(positive, threshold_quantile))
+    proposal_count = max_peaks
+    if enable_blob_size_filter:
+        proposal_count = max(proposal_count, int(round(max_peaks * blob_filter_oversample_factor)))
+    if proposal_scorer is not None:
+        proposal_count = max(proposal_count, int(round(max_peaks * proposal_scorer_oversample_factor)))
+
     peaks = peak_local_max(
         smoothed,
         min_distance=min_peak_distance,
         threshold_abs=threshold,
         exclude_border=False,
-        num_peaks=(
-            max_peaks
-            if not enable_blob_size_filter
-            else max(max_peaks, int(round(max_peaks * blob_filter_oversample_factor)))
-        ),
+        num_peaks=proposal_count,
     )
     if len(peaks) == 0:
         return np.zeros((0, 4), dtype=np.float32)
@@ -383,7 +533,7 @@ def detect_frame(
             smoothed,
             peaks,
             intensities,
-            max_peaks=max_peaks,
+            max_peaks=proposal_count if proposal_scorer is not None else max_peaks,
             mode=blob_size_mode,
             min_voxels=blob_min_voxels,
             max_voxels=blob_max_voxels,
@@ -394,9 +544,20 @@ def detect_frame(
             alpha=blob_alpha,
             background_percentile=blob_background_percentile,
         )
-    else:
+    elif proposal_scorer is None:
         peaks = peaks[:max_peaks]
         intensities = intensities[:max_peaks]
+    if proposal_scorer is not None:
+        peaks, intensities = rescore_proposals_with_cnn(
+            volume,
+            peaks,
+            intensities,
+            scorer=proposal_scorer,
+            max_peaks=max_peaks,
+            threshold=proposal_scorer_threshold,
+            batch_size=proposal_scorer_batch_size,
+            min_keep_fraction=proposal_scorer_min_keep_fraction,
+        )
     if enable_centroid_refinement:
         peaks = refine_peak_centroids(
             smoothed,
@@ -416,6 +577,9 @@ def build_nodes(image, args: argparse.Namespace) -> list[dict]:
     total_frames = int(image.shape[0])
     frame_count = total_frames if args.max_frames is None else min(args.max_frames, total_frames)
     threshold_quantile, max_peaks_per_frame = estimate_adaptive_detection_settings(image, args, frame_count)
+    proposal_scorer = None
+    if args.proposal_scorer_path is not None:
+        proposal_scorer = load_proposal_scorer(args.proposal_scorer_path, args.proposal_scorer_device)
 
     nodes: list[dict] = []
     next_id = 1
@@ -445,6 +609,11 @@ def build_nodes(image, args: argparse.Namespace) -> list[dict]:
             centroid_alpha=args.centroid_alpha,
             centroid_background_percentile=args.centroid_background_percentile,
             centroid_crop_radius_zyx=centroid_crop_radius_zyx,
+            proposal_scorer=proposal_scorer,
+            proposal_scorer_threshold=args.proposal_scorer_threshold,
+            proposal_scorer_oversample_factor=args.proposal_scorer_oversample_factor,
+            proposal_scorer_batch_size=args.proposal_scorer_batch_size,
+            proposal_scorer_min_keep_fraction=args.proposal_scorer_min_keep_fraction,
         )
         print(f"t={t:03d}: {len(peaks)} peaks")
         for z, y, x, score in peaks:
