@@ -41,6 +41,15 @@ def parse_args() -> argparse.Namespace:
         help="Spatial crop radius around the selected division, as z,y,x voxels.",
     )
     parser.add_argument(
+        "--plane",
+        choices=["auto", "xy", "xz", "yz", "volume"],
+        default="auto",
+        help=(
+            "Viewing plane. auto chooses the orthogonal projection where daughters are most separated; "
+            "volume shows the cropped 4D volume."
+        ),
+    )
+    parser.add_argument(
         "--only-division-index",
         action="store_true",
         help="Show only the selected division instead of all labeled divisions in the GEFF.",
@@ -117,6 +126,38 @@ def crop_bounds_for_division(division: dict, image_shape: tuple[int, ...], time_
     return lo, tuple(slice(int(lo[i]), int(hi[i])) for i in range(4))
 
 
+def choose_best_plane(division: dict) -> str:
+    daughters = np.asarray([row[2:5] for row in division["daughters"]], dtype=float)
+    delta_um = np.abs(daughters[1] - daughters[0]) * np.asarray(VOXEL_SCALE_TZYX[1:], dtype=float)
+    drop_axis = int(np.argmin(delta_um))
+    return ["yz", "xz", "xy"][drop_axis]
+
+
+def project_image(cropped_image: da.Array, plane: str) -> tuple[da.Array, tuple[float, float, float], tuple[str, str, str]]:
+    if plane == "xy":
+        return cropped_image.max(axis=1), (VOXEL_SCALE_TZYX[0], VOXEL_SCALE_TZYX[2], VOXEL_SCALE_TZYX[3]), ("t", "y", "x")
+    if plane == "xz":
+        return cropped_image.max(axis=2), (VOXEL_SCALE_TZYX[0], VOXEL_SCALE_TZYX[1], VOXEL_SCALE_TZYX[3]), ("t", "z", "x")
+    if plane == "yz":
+        return cropped_image.max(axis=3), (VOXEL_SCALE_TZYX[0], VOXEL_SCALE_TZYX[1], VOXEL_SCALE_TZYX[2]), ("t", "z", "y")
+    raise ValueError(f"Unsupported plane: {plane}")
+
+
+def project_points(points: list[list[float]], plane: str) -> np.ndarray:
+    array = np.asarray(points, dtype=float)
+    if plane == "xy":
+        return array[:, [0, 2, 3]]
+    if plane == "xz":
+        return array[:, [0, 1, 3]]
+    if plane == "yz":
+        return array[:, [0, 1, 2]]
+    raise ValueError(f"Unsupported plane: {plane}")
+
+
+def project_lines(line_data: list[np.ndarray], plane: str) -> list[np.ndarray]:
+    return [project_points(line.tolist(), plane) for line in line_data]
+
+
 def main() -> None:
     args = parse_args()
     image = da.from_zarr(zarr.open(args.zarr_path / args.array_path, mode="r"))
@@ -150,11 +191,13 @@ def main() -> None:
         crop_radius_zyx,
     )
     cropped_image = image[crop_slices]
+    plane = choose_best_plane(selected_division) if args.plane == "auto" else args.plane
     print(
         "Crop origin t,z,y,x="
         f"{crop_origin.tolist()} shape={tuple(int(v) for v in cropped_image.shape)} "
         f"slices={[(s.start, s.stop) for s in crop_slices]}"
     )
+    print(f"Viewing plane: {plane}")
 
     if args.only_division_index:
         visible_divisions = [selected_division]
@@ -194,55 +237,71 @@ def main() -> None:
         midpoint_points.append(midpoint.tolist())
 
     viewer = napari.Viewer()
+    if plane == "volume":
+        display_image = cropped_image
+        display_scale = VOXEL_SCALE_TZYX
+        axis_labels = ("t", "z", "y", "x")
+        display_parent_points = np.asarray(parent_points, dtype=float)
+        display_daughter_points = np.asarray(daughter_points, dtype=float)
+        display_midpoint_points = np.asarray(midpoint_points, dtype=float)
+        display_line_data = line_data
+        text_translation = [0, 0, 4, 4]
+    else:
+        display_image, display_scale, axis_labels = project_image(cropped_image, plane)
+        display_parent_points = project_points(parent_points, plane)
+        display_daughter_points = project_points(daughter_points, plane)
+        display_midpoint_points = project_points(midpoint_points, plane)
+        display_line_data = project_lines(line_data, plane)
+        text_translation = [0, 4, 4]
     try:
-        viewer.dims.axis_labels = ("t", "z", "y", "x")
+        viewer.dims.axis_labels = axis_labels
     except Exception:
         pass
 
     image_kwargs = {
-        "name": f"{args.zarr_path.stem} division crop",
-        "scale": VOXEL_SCALE_TZYX,
+        "name": f"{args.zarr_path.stem} division {plane}",
+        "scale": display_scale,
         "blending": "additive",
     }
     if args.contrast_min is not None or args.contrast_max is not None:
         image_kwargs["contrast_limits"] = (
             0.0 if args.contrast_min is None else args.contrast_min,
-            float(cropped_image.max().compute()) if args.contrast_max is None else args.contrast_max,
+            float(display_image.max().compute()) if args.contrast_max is None else args.contrast_max,
         )
-    viewer.add_image(cropped_image, **image_kwargs)
+    viewer.add_image(display_image, **image_kwargs)
 
     viewer.add_points(
-        np.asarray(parent_points, dtype=float),
+        display_parent_points,
         name="division parents",
-        scale=VOXEL_SCALE_TZYX,
+        scale=display_scale,
         size=args.point_size,
         face_color="yellow",
         opacity=1.0,
-        text={"string": parent_labels, "size": 7, "color": "yellow", "translation": [0, 0, 4, 4]},
+        text={"string": parent_labels, "size": 7, "color": "yellow", "translation": text_translation},
     )
     viewer.add_points(
-        np.asarray(daughter_points, dtype=float),
+        display_daughter_points,
         name="division daughters",
-        scale=VOXEL_SCALE_TZYX,
+        scale=display_scale,
         size=args.point_size * 0.9,
         face_color="cyan",
         opacity=1.0,
-        text={"string": daughter_labels, "size": 7, "color": "cyan", "translation": [0, 0, 4, 4]},
+        text={"string": daughter_labels, "size": 7, "color": "cyan", "translation": text_translation},
     )
     viewer.add_points(
-        np.asarray(midpoint_points, dtype=float),
+        display_midpoint_points,
         name="daughter midpoints",
-        scale=VOXEL_SCALE_TZYX,
+        scale=display_scale,
         size=args.point_size * 0.6,
         face_color="magenta",
         opacity=0.8,
     )
-    if line_data:
+    if display_line_data:
         viewer.add_shapes(
-            line_data,
+            display_line_data,
             shape_type="line",
             name="parent-to-daughter edges",
-            scale=VOXEL_SCALE_TZYX,
+            scale=display_scale,
             edge_color="lime",
             edge_width=2,
             opacity=0.9,
@@ -250,8 +309,16 @@ def main() -> None:
 
     selected = divisions[args.division_index]["parent"].astype(int)
     selected_crop_step = (selected[1:5] - crop_origin).astype(int)
+    if plane == "xy":
+        selected_step = selected_crop_step[[0, 2, 3]]
+    elif plane == "xz":
+        selected_step = selected_crop_step[[0, 1, 3]]
+    elif plane == "yz":
+        selected_step = selected_crop_step[[0, 1, 2]]
+    else:
+        selected_step = selected_crop_step
     try:
-        viewer.dims.current_step = tuple(selected_crop_step.tolist())
+        viewer.dims.current_step = tuple(selected_step.tolist())
     except Exception:
         pass
     print(

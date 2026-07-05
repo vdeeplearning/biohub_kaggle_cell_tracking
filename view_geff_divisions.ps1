@@ -13,6 +13,9 @@ param(
 
     [string]$CropRadiusZyx = "8,48,48",
 
+    [ValidateSet("auto", "xy", "xz", "yz", "volume")]
+    [string]$Plane = "auto",
+
     [double]$ContrastMin = [double]::NaN,
     [double]$ContrastMax = [double]::NaN,
 
@@ -31,7 +34,9 @@ $ArgsList = @(
     "--time-radius",
     "$TimeRadius",
     "--crop-radius-zyx",
-    "$CropRadiusZyx"
+    "$CropRadiusZyx",
+    "--plane",
+    "$Plane"
 )
 
 if ($OnlyDivisionIndex) {
