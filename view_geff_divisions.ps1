@@ -9,6 +9,10 @@ param(
 
     [switch]$OnlyDivisionIndex,
 
+    [int]$TimeRadius = 3,
+
+    [string]$CropRadiusZyx = "8,48,48",
+
     [double]$ContrastMin = [double]::NaN,
     [double]$ContrastMax = [double]::NaN,
 
@@ -23,7 +27,11 @@ $ArgsList = @(
     $ZarrPath,
     $GeffPath,
     "--division-index",
-    "$DivisionIndex"
+    "$DivisionIndex",
+    "--time-radius",
+    "$TimeRadius",
+    "--crop-radius-zyx",
+    "$CropRadiusZyx"
 )
 
 if ($OnlyDivisionIndex) {

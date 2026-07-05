@@ -28,7 +28,18 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Which labeled division to jump to initially, 0-based in the printed list.",
     )
-    parser.add_argument("--point-size", type=float, default=12.0)
+    parser.add_argument("--point-size", type=float, default=3.0)
+    parser.add_argument(
+        "--time-radius",
+        type=int,
+        default=3,
+        help="Number of frames before/after the division parent time to show in the cropped viewer.",
+    )
+    parser.add_argument(
+        "--crop-radius-zyx",
+        default="8,48,48",
+        help="Spatial crop radius around the selected division, as z,y,x voxels.",
+    )
     parser.add_argument(
         "--only-division-index",
         action="store_true",
@@ -83,6 +94,29 @@ def as_point(row: np.ndarray) -> list[float]:
     return [float(row[1]), float(row[2]), float(row[3]), float(row[4])]
 
 
+def parse_int_triplet(text: str) -> tuple[int, int, int]:
+    parts = [int(round(float(p.strip()))) for p in text.split(",")]
+    if len(parts) != 3:
+        raise ValueError("--crop-radius-zyx must have 3 comma-separated values")
+    return tuple(parts)
+
+
+def crop_bounds_for_division(division: dict, image_shape: tuple[int, ...], time_radius: int, crop_radius_zyx: tuple[int, int, int]) -> tuple[np.ndarray, tuple[slice, slice, slice, slice]]:
+    rows = [division["parent"], *division["daughters"]]
+    coords = np.asarray([row[1:5] for row in rows], dtype=int)
+    center = np.rint(coords.mean(axis=0)).astype(int)
+    radius = np.asarray([time_radius, *crop_radius_zyx], dtype=int)
+    lo = np.maximum(center - radius, 0)
+    hi = np.minimum(center + radius + 1, np.asarray(image_shape, dtype=int))
+
+    # Always include the parent and daughter coordinates, even when their midpoint is off-center.
+    lo = np.minimum(lo, coords.min(axis=0))
+    hi = np.maximum(hi, coords.max(axis=0) + 1)
+    lo = np.maximum(lo, 0)
+    hi = np.minimum(hi, np.asarray(image_shape, dtype=int))
+    return lo, tuple(slice(int(lo[i]), int(hi[i])) for i in range(4))
+
+
 def main() -> None:
     args = parse_args()
     image = da.from_zarr(zarr.open(args.zarr_path / args.array_path, mode="r"))
@@ -107,7 +141,31 @@ def main() -> None:
     if args.division_index < 0 or args.division_index >= len(divisions):
         raise ValueError(f"--division-index must be between 0 and {len(divisions) - 1}")
 
-    visible_divisions = [divisions[args.division_index]] if args.only_division_index else divisions
+    selected_division = divisions[args.division_index]
+    crop_radius_zyx = parse_int_triplet(args.crop_radius_zyx)
+    crop_origin, crop_slices = crop_bounds_for_division(
+        selected_division,
+        tuple(int(v) for v in image.shape),
+        args.time_radius,
+        crop_radius_zyx,
+    )
+    cropped_image = image[crop_slices]
+    print(
+        "Crop origin t,z,y,x="
+        f"{crop_origin.tolist()} shape={tuple(int(v) for v in cropped_image.shape)} "
+        f"slices={[(s.start, s.stop) for s in crop_slices]}"
+    )
+
+    if args.only_division_index:
+        visible_divisions = [selected_division]
+    else:
+        # In cropped mode, only show divisions whose parent is inside this crop.
+        visible_divisions = [
+            division
+            for division in divisions
+            if np.all(division["parent"][1:5] >= crop_origin)
+            and np.all(division["parent"][1:5] < crop_origin + np.asarray(cropped_image.shape))
+        ]
 
     parent_points = []
     daughter_points = []
@@ -120,13 +178,13 @@ def main() -> None:
         original_index = args.division_index if args.only_division_index else i
         parent = division["parent"]
         daughters = division["daughters"]
-        parent_point = as_point(parent)
+        parent_point = (np.asarray(as_point(parent), dtype=float) - crop_origin).tolist()
         parent_points.append(parent_point)
         parent_labels.append(f"D{original_index} parent {int(parent[0])}")
 
         daughter_coords = []
         for daughter_number, daughter in enumerate(daughters, start=1):
-            daughter_point = as_point(daughter)
+            daughter_point = (np.asarray(as_point(daughter), dtype=float) - crop_origin).tolist()
             daughter_points.append(daughter_point)
             daughter_coords.append(daughter_point)
             daughter_labels.append(f"D{original_index} daughter {daughter_number} {int(daughter[0])}")
@@ -142,16 +200,16 @@ def main() -> None:
         pass
 
     image_kwargs = {
-        "name": args.zarr_path.stem,
+        "name": f"{args.zarr_path.stem} division crop",
         "scale": VOXEL_SCALE_TZYX,
         "blending": "additive",
     }
     if args.contrast_min is not None or args.contrast_max is not None:
         image_kwargs["contrast_limits"] = (
             0.0 if args.contrast_min is None else args.contrast_min,
-            float(image.max().compute()) if args.contrast_max is None else args.contrast_max,
+            float(cropped_image.max().compute()) if args.contrast_max is None else args.contrast_max,
         )
-    viewer.add_image(image, **image_kwargs)
+    viewer.add_image(cropped_image, **image_kwargs)
 
     viewer.add_points(
         np.asarray(parent_points, dtype=float),
@@ -160,7 +218,7 @@ def main() -> None:
         size=args.point_size,
         face_color="yellow",
         opacity=1.0,
-        text={"string": parent_labels, "size": 9, "color": "yellow"},
+        text={"string": parent_labels, "size": 7, "color": "yellow", "translation": [0, 0, 4, 4]},
     )
     viewer.add_points(
         np.asarray(daughter_points, dtype=float),
@@ -169,7 +227,7 @@ def main() -> None:
         size=args.point_size * 0.9,
         face_color="cyan",
         opacity=1.0,
-        text={"string": daughter_labels, "size": 9, "color": "cyan"},
+        text={"string": daughter_labels, "size": 7, "color": "cyan", "translation": [0, 0, 4, 4]},
     )
     viewer.add_points(
         np.asarray(midpoint_points, dtype=float),
@@ -191,8 +249,9 @@ def main() -> None:
         )
 
     selected = divisions[args.division_index]["parent"].astype(int)
+    selected_crop_step = (selected[1:5] - crop_origin).astype(int)
     try:
-        viewer.dims.current_step = tuple(selected[1:5].tolist())
+        viewer.dims.current_step = tuple(selected_crop_step.tolist())
     except Exception:
         pass
     print(
